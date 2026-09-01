@@ -8,6 +8,13 @@ from pathlib import Path
 # `git diff` cannot do -- it would compare against the working tree instead.
 ROOT_DIFF = ["diff-tree", "--root", "--no-commit-id", "-M"]
 
+# core.quotepath defaults to true, which makes git wrap any path containing
+# non-ASCII bytes in quotes and escape them octally ("caf\303\251.md"). Feeding
+# that back to `git show` fails, so such files were silently dropped from
+# current_files and recorded under mangled paths in file_changes. Scraped web
+# content is full of curly apostrophes, so this is not a rare edge case.
+GIT = ["git", "-c", "core.quotepath=false"]
+
 
 def run_git(*args: str, check: bool = True) -> str:
     """Run a git command and return stripped stdout.
@@ -16,7 +23,7 @@ def run_git(*args: str, check: bool = True) -> str:
     must use run_git_bytes instead, which neither strips nor decodes.
     """
     result = subprocess.run(
-        ["git", *args],
+        [*GIT, *args],
         capture_output=True,
         text=True,
         check=check,
@@ -31,7 +38,7 @@ def run_git_bytes(*args: str) -> bytes | None:
     trailing newlines and leading whitespace, and decoding as text raises on
     binary files before is_binary ever gets to reject them.
     """
-    result = subprocess.run(["git", *args], capture_output=True)
+    result = subprocess.run([*GIT, *args], capture_output=True)
     if result.returncode != 0:
         return None
     return result.stdout
@@ -121,10 +128,14 @@ def get_branch_head_sha(branch: str) -> str | None:
         The SHA of the branch HEAD, or None if branch doesn't exist.
     """
     try:
-        sha = run_git("rev-parse", branch, check=False)
-        if sha:
-            return sha
-        return None
+        # --verify --quiet prints nothing and exits non-zero for an unknown
+        # ref. Plain `git rev-parse <branch>` echoes the argument back on
+        # stdout, so a missing branch would be recorded as a head_sha of
+        # literally "main".
+        sha = run_git(
+            "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}", check=False
+        )
+        return sha or None
     except subprocess.CalledProcessError:
         return None
 
@@ -141,7 +152,7 @@ def is_ancestor(ancestor_sha: str, descendant_sha: str) -> bool:
     """
     try:
         result = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", ancestor_sha, descendant_sha],
+            [*GIT, "merge-base", "--is-ancestor", ancestor_sha, descendant_sha],
             capture_output=True,
             text=True,
         )

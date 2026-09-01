@@ -34,3 +34,29 @@ class TestTruncateDiff:
 
         result.encode("utf-8").decode("utf-8")  # raises if malformed
         assert result.startswith("é" * 2)
+
+
+class TestGetBranchHeadSha:
+    """Regression: `git rev-parse <missing>` echoes its argument to stdout."""
+
+    def test_returns_none_for_an_unknown_branch(self, tmp_path, monkeypatch):
+        import subprocess
+
+        from gtl.git import get_branch_head_sha
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for args in (
+            ["init", "-b", "master"],
+            ["config", "user.email", "t@example.com"],
+            ["config", "user.name", "T"],
+        ):
+            subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+        (repo / "f.txt").write_text("x\n")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "c"], check=True, capture_output=True)
+        monkeypatch.chdir(repo)
+
+        assert get_branch_head_sha("no-such-branch") is None
+        head = get_branch_head_sha("master")
+        assert head is not None and len(head) == 40

@@ -171,6 +171,42 @@ class TestContentFidelity:
         assert stored["unicode.md"]["size_bytes"] == 7  # 6 characters, 7 bytes
 
 
+class TestNonAsciiPaths:
+    """Regression: git quotes non-ASCII paths unless core.quotepath is off."""
+
+    def test_keeps_files_whose_path_has_a_curly_apostrophe(
+        self, repo, client, monkeypatch
+    ):
+        # Exactly the shape that appears in scraped web content
+        name = "it\u2019s-time.md"
+        (repo / name).write_text("body\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-m", "add curly apostrophe file")
+        monkeypatch.chdir(repo)
+
+        run_sync(branch="main")
+
+        stored = {f["file_path"]: f for f in rows(client, "current_files")}
+        # Quoted output would drop the file entirely and escape the path
+        assert name in stored
+        assert stored[name]["content"] == "body\n"
+        assert not any(p.startswith('"') for p in stored)
+
+    def test_records_accented_paths_unescaped_in_file_changes(
+        self, repo, client, monkeypatch
+    ):
+        (repo / "caf\u00e9.md").write_text("espresso\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-m", "add accented file")
+        monkeypatch.chdir(repo)
+
+        run_sync(branch="main")
+
+        paths = {c["file_path"] for c in rows(client, "file_changes")}
+        assert "caf\u00e9.md" in paths
+        assert not any("\\3" in p for p in paths), "octal escapes leaked into paths"
+
+
 class TestInitialCommit:
     """Regression: `git diff --root` compared against the working tree."""
 
