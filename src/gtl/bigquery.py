@@ -1,89 +1,183 @@
 """BigQuery operations for gtl."""
 
+import re
 from datetime import datetime, timedelta, timezone
+
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
 
+# Location used when none is configured and the dataset does not exist yet.
+DEFAULT_LOCATION = "US"
 
-def get_client(project: str) -> bigquery.Client:
-    """Create a BigQuery client."""
-    return bigquery.Client(project=project)
+# Table definitions, shared by schema creation and the load jobs that write
+# rows. Keeping one copy means a load job can never disagree with the table it
+# writes into.
+TABLE_SCHEMAS: dict[str, list[bigquery.SchemaField]] = {
+    "repositories": [
+        bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("name", "STRING"),
+        bigquery.SchemaField("url", "STRING"),
+        bigquery.SchemaField("created_at", "TIMESTAMP"),
+    ],
+    "branches": [
+        bigquery.SchemaField("repo_id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("name", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("head_sha", "STRING"),
+        bigquery.SchemaField("is_default", "BOOL"),
+        bigquery.SchemaField("created_at", "TIMESTAMP"),
+        bigquery.SchemaField("updated_at", "TIMESTAMP"),
+    ],
+    "commits": [
+        bigquery.SchemaField("repo_id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("sha", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("branch", "STRING"),
+        bigquery.SchemaField("author_name", "STRING"),
+        bigquery.SchemaField("author_email", "STRING"),
+        bigquery.SchemaField("committed_at", "TIMESTAMP"),
+        bigquery.SchemaField("message", "STRING"),
+        bigquery.SchemaField("parent_sha", "STRING"),
+        bigquery.SchemaField("ingested_at", "TIMESTAMP"),
+    ],
+    "file_changes": [
+        bigquery.SchemaField("repo_id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("commit_sha", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("file_path", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("change_type", "STRING"),
+        bigquery.SchemaField("old_path", "STRING"),
+        bigquery.SchemaField("diff", "STRING"),
+        bigquery.SchemaField("additions", "INT64"),
+        bigquery.SchemaField("deletions", "INT64"),
+        bigquery.SchemaField("ingested_at", "TIMESTAMP"),
+    ],
+    "current_files": [
+        bigquery.SchemaField("repo_id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("file_path", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("branch", "STRING"),
+        bigquery.SchemaField("content", "STRING"),
+        bigquery.SchemaField("size_bytes", "INT64"),
+        bigquery.SchemaField("last_commit_sha", "STRING"),
+        bigquery.SchemaField("updated_at", "TIMESTAMP"),
+    ],
+}
 
 
-def ensure_dataset(client: bigquery.Client, dataset: str) -> None:
-    """Create dataset if it doesn't exist."""
+def sanitize_identifier(value: str) -> str:
+    """Reduce an arbitrary string to characters safe in a BigQuery table name."""
+    return re.sub(r"[^A-Za-z0-9_]", "_", value)
+
+
+def get_client(project: str, location: str | None = None) -> bigquery.Client:
+    """Create a BigQuery client.
+
+    Args:
+        project: GCP project ID.
+        location: BigQuery location (e.g. "EU", "US", "europe-west3"). Becomes
+            the default location for every job this client runs. Jobs must run
+            in the same location as the dataset they touch.
+    """
+    return bigquery.Client(project=project, location=location)
+
+
+def load_rows(
+    client: bigquery.Client,
+    table_id: str,
+    schema: list[bigquery.SchemaField],
+    rows: list[dict],
+) -> None:
+    """Append rows to a table with a load job.
+
+    Load jobs are used in preference to insert_rows_json because rows written
+    by the legacy streaming API sit in a buffer that UPDATE, DELETE and MERGE
+    cannot reach for some time after the write. gtl issues exactly those
+    statements immediately after writing (update_branch_head and
+    upsert_current_files), so streaming would make a first sync fail. Load jobs
+    land directly in the table, carry far larger size limits, and are free.
+    """
+    if not rows:
+        return
+
+    job_config = bigquery.LoadJobConfig(
+        schema=schema,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+    )
+    job = client.load_table_from_json(rows, table_id, job_config=job_config)
+    job.result()  # Wait for completion; raises on failure
+
+
+def ensure_dataset(
+    client: bigquery.Client,
+    dataset: str,
+    location: str | None = None,
+) -> str:
+    """Create the dataset if it doesn't exist, and report its location.
+
+    Args:
+        client: BigQuery client.
+        dataset: BigQuery dataset name.
+        location: Requested location. When the dataset already exists its own
+            location wins unless an explicit, conflicting one was requested.
+
+    Returns:
+        The location the dataset actually lives in.
+
+    Raises:
+        ValueError: If the dataset exists in a location other than the one
+            explicitly requested. BigQuery cannot move a dataset between
+            locations or join across them, so this is a configuration error
+            rather than something to silently work around.
+    """
+    requested = location or client.location
     dataset_ref = client.dataset(dataset)
+
     try:
-        client.get_dataset(dataset_ref)
+        existing = client.get_dataset(dataset_ref)
     except NotFound:
+        target = requested or DEFAULT_LOCATION
         ds = bigquery.Dataset(dataset_ref)
-        ds.location = "US"
+        ds.location = target
         client.create_dataset(ds)
+        return target
+
+    if (
+        requested
+        and existing.location
+        and existing.location.upper() != requested.upper()
+    ):
+        raise ValueError(
+            f"Dataset {client.project}.{dataset} already exists in location "
+            f"'{existing.location}', but '{requested}' was requested. BigQuery "
+            "cannot move a dataset between locations -- either use "
+            f"--location={existing.location} or pick a different dataset."
+        )
+
+    return existing.location or requested or DEFAULT_LOCATION
 
 
-def ensure_schema(client: bigquery.Client, dataset: str) -> None:
-    """Create tables if they don't exist."""
+def ensure_schema(
+    client: bigquery.Client,
+    dataset: str,
+    location: str | None = None,
+) -> str:
+    """Create tables if they don't exist.
+
+    Returns:
+        The location the dataset lives in.
+    """
     project = client.project
 
     # Ensure dataset exists first
-    ensure_dataset(client, dataset)
+    resolved_location = ensure_dataset(client, dataset, location)
 
-    # Define table schemas
-    tables = {
-        "repositories": [
-            bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("name", "STRING"),
-            bigquery.SchemaField("url", "STRING"),
-            bigquery.SchemaField("created_at", "TIMESTAMP"),
-        ],
-        "branches": [
-            bigquery.SchemaField("repo_id", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("name", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("head_sha", "STRING"),
-            bigquery.SchemaField("is_default", "BOOL"),
-            bigquery.SchemaField("created_at", "TIMESTAMP"),
-            bigquery.SchemaField("updated_at", "TIMESTAMP"),
-        ],
-        "commits": [
-            bigquery.SchemaField("repo_id", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("sha", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("branch", "STRING"),
-            bigquery.SchemaField("author_name", "STRING"),
-            bigquery.SchemaField("author_email", "STRING"),
-            bigquery.SchemaField("committed_at", "TIMESTAMP"),
-            bigquery.SchemaField("message", "STRING"),
-            bigquery.SchemaField("parent_sha", "STRING"),
-            bigquery.SchemaField("ingested_at", "TIMESTAMP"),
-        ],
-        "file_changes": [
-            bigquery.SchemaField("repo_id", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("commit_sha", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("file_path", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("change_type", "STRING"),
-            bigquery.SchemaField("old_path", "STRING"),
-            bigquery.SchemaField("diff", "STRING"),
-            bigquery.SchemaField("additions", "INT64"),
-            bigquery.SchemaField("deletions", "INT64"),
-            bigquery.SchemaField("ingested_at", "TIMESTAMP"),
-        ],
-        "current_files": [
-            bigquery.SchemaField("repo_id", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("file_path", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("branch", "STRING"),
-            bigquery.SchemaField("content", "STRING"),
-            bigquery.SchemaField("size_bytes", "INT64"),
-            bigquery.SchemaField("last_commit_sha", "STRING"),
-            bigquery.SchemaField("updated_at", "TIMESTAMP"),
-        ],
-    }
-
-    for table_name, schema in tables.items():
+    for table_name, schema in TABLE_SCHEMAS.items():
         table_id = f"{project}.{dataset}.{table_name}"
         table = bigquery.Table(table_id, schema=schema)
         try:
             client.get_table(table_id)
         except NotFound:
             client.create_table(table)
+
+    return resolved_location
 
 
 def ensure_repo(
@@ -118,9 +212,7 @@ def ensure_repo(
             "url": url,
             "created_at": now,
         }]
-        errors = client.insert_rows_json(table_id, rows)
-        if errors:
-            raise RuntimeError(f"Failed to insert repository: {errors}")
+        load_rows(client, table_id, TABLE_SCHEMAS["repositories"], rows)
 
 
 def ensure_branch(
@@ -158,9 +250,7 @@ def ensure_branch(
             "created_at": now,
             "updated_at": now,
         }]
-        errors = client.insert_rows_json(table_id, rows)
-        if errors:
-            raise RuntimeError(f"Failed to insert branch: {errors}")
+        load_rows(client, table_id, TABLE_SCHEMAS["branches"], rows)
 
 
 def update_branch_head(
@@ -313,13 +403,7 @@ def insert_commits(
             "ingested_at": now,
         })
 
-    # Use streaming inserts with batching
-    batch_size = 500
-    for i in range(0, len(rows), batch_size):
-        batch = rows[i:i + batch_size]
-        errors = client.insert_rows_json(table_id, batch)
-        if errors:
-            raise RuntimeError(f"Failed to insert commits: {errors}")
+    load_rows(client, table_id, TABLE_SCHEMAS["commits"], rows)
 
 
 def insert_file_changes(
@@ -349,13 +433,7 @@ def insert_file_changes(
             "ingested_at": now,
         })
 
-    # Use streaming inserts with batching
-    batch_size = 500
-    for i in range(0, len(rows), batch_size):
-        batch = rows[i:i + batch_size]
-        errors = client.insert_rows_json(table_id, batch)
-        if errors:
-            raise RuntimeError(f"Failed to insert file changes: {errors}")
+    load_rows(client, table_id, TABLE_SCHEMAS["file_changes"], rows)
 
 
 def upsert_current_files(
@@ -381,19 +459,13 @@ def upsert_current_files(
     now = datetime.now(timezone.utc).isoformat()
 
     # Create a temporary table with the new files
-    branch_suffix = f"_{branch.replace('/', '_').replace('-', '_')}" if branch else ""
-    temp_table_id = f"{project}.{dataset}._gtl_temp_files_{repo_id.replace('/', '_').replace('.', '_')}{branch_suffix}"
+    branch_suffix = f"_{sanitize_identifier(branch)}" if branch else ""
+    temp_table_id = (
+        f"{project}.{dataset}."
+        f"_gtl_temp_files_{sanitize_identifier(repo_id)}{branch_suffix}"
+    )
 
-    # Define schema for temp table
-    schema = [
-        bigquery.SchemaField("repo_id", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("file_path", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("branch", "STRING"),
-        bigquery.SchemaField("content", "STRING"),
-        bigquery.SchemaField("size_bytes", "INT64"),
-        bigquery.SchemaField("last_commit_sha", "STRING"),
-        bigquery.SchemaField("updated_at", "TIMESTAMP"),
-    ]
+    schema = TABLE_SCHEMAS["current_files"]
 
     # Create temp table
     temp_table = bigquery.Table(temp_table_id, schema=schema)
@@ -403,33 +475,20 @@ def upsert_current_files(
         client.delete_table(temp_table_id, not_found_ok=True)
         client.create_table(temp_table)
 
-        # Insert files into temp table
-        if files:
-            rows = []
-            for f in files:
-                rows.append({
-                    "repo_id": repo_id,
-                    "file_path": f["file_path"],
-                    "branch": branch,
-                    "content": f["content"],
-                    "size_bytes": f["size_bytes"],
-                    "last_commit_sha": f.get("last_commit_sha"),
-                    "updated_at": now,
-                })
-
-            # Use load job for better handling of large data
-            job_config = bigquery.LoadJobConfig(
-                schema=schema,
-                write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-            )
-
-            # Insert in batches using streaming
-            batch_size = 500
-            for i in range(0, len(rows), batch_size):
-                batch = rows[i:i + batch_size]
-                errors = client.insert_rows_json(temp_table_id, batch)
-                if errors:
-                    raise RuntimeError(f"Failed to insert temp files: {errors}")
+        # Load files into the freshly created (empty) temp table
+        rows = [
+            {
+                "repo_id": repo_id,
+                "file_path": f["file_path"],
+                "branch": branch,
+                "content": f["content"],
+                "size_bytes": f["size_bytes"],
+                "last_commit_sha": f.get("last_commit_sha"),
+                "updated_at": now,
+            }
+            for f in files
+        ]
+        load_rows(client, temp_table_id, schema, rows)
 
         # Build the MERGE query with branch-aware matching
         if branch:

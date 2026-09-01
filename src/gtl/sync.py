@@ -3,14 +3,50 @@
 from . import git
 from . import bigquery as bq
 
+# Default cap on a single file's diff, in bytes. Generous enough for ordinary
+# changes, small enough that a wholesale file rewrite cannot blow a row past
+# BigQuery's limits.
+DEFAULT_MAX_DIFF_SIZE = 1048576
+
+# Commits are written in batches rather than one API call at a time. Each
+# flush also advances the branch head, so an interrupted sync resumes from the
+# last durable batch instead of re-inserting commits it already wrote.
+COMMIT_BATCH_SIZE = 100
+
+
+def connect(
+    project: str,
+    dataset: str,
+    location: str | None = None,
+) -> tuple[object, str]:
+    """Create a client and make sure the dataset and tables exist.
+
+    BigQuery jobs must run in the same location as the dataset they touch. When
+    no location is configured we let an existing dataset tell us where it lives
+    and rebind the client to it, so a dataset created outside gtl (or before
+    --location existed) keeps working without extra flags.
+
+    Returns:
+        (client, location) with the client bound to the dataset's location.
+    """
+    client = bq.get_client(project, location)
+    resolved_location = bq.ensure_schema(client, dataset, location)
+
+    if client.location != resolved_location:
+        client = bq.get_client(project, resolved_location)
+
+    return client, resolved_location
+
 
 def sync(
     project: str,
     dataset: str,
+    location: str | None = None,
     repo_id: str | None = None,
     branch: str | None = None,
     all_branches: bool = False,
     max_file_size: int = 102400,
+    max_diff_size: int = DEFAULT_MAX_DIFF_SIZE,
     verbose: bool = False,
 ) -> dict:
     """Main sync orchestration.
@@ -23,10 +59,13 @@ def sync(
     Args:
         project: GCP project ID
         dataset: BigQuery dataset name
+        location: BigQuery location (e.g. "EU"). Auto-detected from an
+            existing dataset when not given.
         repo_id: Repository identifier (auto-detected if not provided)
         branch: Specific branch to sync (defaults to current branch)
         all_branches: Sync all branches instead of just one
         max_file_size: Maximum file size in bytes (default: 100KB)
+        max_diff_size: Maximum size of a single diff in bytes (0 disables)
         verbose: Print progress information
 
     Returns:
@@ -47,11 +86,11 @@ def sync(
     if verbose:
         print(f"Syncing repository: {repo_id}")
 
-    # Initialize BigQuery client
-    client = bq.get_client(project)
+    # Initialize BigQuery client and ensure the schema exists
+    client, resolved_location = connect(project, dataset, location)
 
-    # Ensure schema exists
-    bq.ensure_schema(client, dataset)
+    if verbose:
+        print(f"Target: {project}.{dataset} ({resolved_location})")
 
     # Ensure repository record exists
     bq.ensure_repo(client, dataset, repo_id, repo_name, repo_url)
@@ -92,6 +131,7 @@ def sync(
             repo_id=repo_id,
             branch=branch_name,
             max_file_size=max_file_size,
+            max_diff_size=max_diff_size,
             verbose=verbose,
         )
         total_commits_processed += result["commits_processed"]
@@ -104,6 +144,7 @@ def sync(
 
     return {
         "repo_id": repo_id,
+        "location": resolved_location,
         "branches_synced": branches_synced,
         "commits_processed": total_commits_processed,
         "file_changes_processed": total_file_changes_processed,
@@ -117,6 +158,7 @@ def sync_branch(
     repo_id: str,
     branch: str,
     max_file_size: int = 102400,
+    max_diff_size: int = DEFAULT_MAX_DIFF_SIZE,
     verbose: bool = False,
 ) -> dict:
     """Sync a specific branch.
@@ -127,6 +169,7 @@ def sync_branch(
         repo_id: Repository identifier
         branch: Branch name to sync
         max_file_size: Maximum file size in bytes
+        max_diff_size: Maximum size of a single diff in bytes (0 disables)
         verbose: Print progress information
 
     Returns:
@@ -160,39 +203,56 @@ def sync_branch(
     # Process commits
     commits_processed = 0
     file_changes_processed = 0
-    last_processed_sha = None
+    pending_commits: list[dict] = []
+    pending_changes: list[dict] = []
+
+    def flush() -> None:
+        """Write the pending batch, then advance the branch head past it."""
+        if not pending_commits:
+            return
+
+        bq.insert_commits(client, dataset, pending_commits)
+        bq.insert_file_changes(client, dataset, pending_changes)
+
+        # Only once the rows are durable, so a failed run resumes from here
+        # rather than duplicating what it already wrote.
+        bq.update_branch_head(
+            client, dataset, repo_id, branch, pending_commits[-1]["sha"]
+        )
+
+        pending_commits.clear()
+        pending_changes.clear()
 
     for commit in commits:
         # Add repo_id and branch to commit
         commit["repo_id"] = repo_id
         commit["branch"] = branch
 
-        # Insert commit
-        bq.insert_commits(client, dataset, [commit])
-        commits_processed += 1
-        last_processed_sha = commit["sha"]
-
         if verbose:
             msg_preview = commit["message"][:50].replace("\n", " ")
             print(f"  Processing commit {commit['sha'][:8]}: {msg_preview}...")
 
         # Get file changes for this commit
-        changes = git.get_file_changes(commit["sha"], commit.get("parent_sha"))
+        changes = git.get_file_changes(
+            commit["sha"], commit.get("parent_sha"), max_diff_size
+        )
 
         # Add repo_id and commit_sha to each change
         for change in changes:
             change["repo_id"] = repo_id
             change["commit_sha"] = commit["sha"]
 
-        # Insert file changes
-        if changes:
-            bq.insert_file_changes(client, dataset, changes)
-            file_changes_processed += len(changes)
+        pending_commits.append(commit)
+        pending_changes.extend(changes)
+        commits_processed += 1
+        file_changes_processed += len(changes)
 
-    # Update branch head SHA
-    if last_processed_sha:
-        bq.update_branch_head(client, dataset, repo_id, branch, last_processed_sha)
-    elif not last_sha:
+        if len(pending_commits) >= COMMIT_BATCH_SIZE:
+            flush()
+
+    flush()
+
+    if not commits_processed and not last_sha:
         # No commits and no previous head - get the current branch head
         current_head = git.get_branch_head_sha(branch)
         if current_head:
@@ -216,25 +276,33 @@ def sync_branch(
     }
 
 
-def init(project: str, dataset: str, verbose: bool = False) -> None:
+def init(
+    project: str,
+    dataset: str,
+    location: str | None = None,
+    verbose: bool = False,
+) -> str:
     """Initialize BigQuery schema.
 
     Args:
         project: GCP project ID
         dataset: BigQuery dataset name
+        location: BigQuery location to create the dataset in (e.g. "EU").
+            Defaults to the location of an existing dataset, else "US".
         verbose: Print progress information
+
+    Returns:
+        The location the dataset lives in.
     """
     if verbose:
         print(f"Initializing schema in {project}.{dataset}")
 
-    client = bq.get_client(project)
-    bq.ensure_schema(client, dataset)
+    _, resolved_location = connect(project, dataset, location)
 
     if verbose:
-        print("Schema initialized successfully!")
+        print(f"Schema initialized successfully in location {resolved_location}!")
         print("Tables created:")
-        print("  - repositories")
-        print("  - branches")
-        print("  - commits")
-        print("  - file_changes")
-        print("  - current_files")
+        for table_name in bq.TABLE_SCHEMAS:
+            print(f"  - {table_name}")
+
+    return resolved_location

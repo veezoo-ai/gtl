@@ -122,7 +122,7 @@ gtl/
 
 ```bash
 # Initialize schema (run once per dataset)
-gtl init --project=my-project --dataset=git_repo
+gtl init --project=my-project --dataset=git_repo --location=EU
 
 # Sync current branch
 gtl sync --project=my-project --dataset=git_repo
@@ -138,6 +138,9 @@ gtl sync --project=my-project --dataset=git_repo --repo-id=github.com/org/repo
 
 # Sync with custom file size limit (default 100KB)
 gtl sync --project=my-project --dataset=git_repo --max-file-size=50000
+
+# Truncate individual diffs (default 1MB, 0 disables)
+gtl sync --project=my-project --dataset=git_repo --max-diff-size=0
 ```
 
 ## Configuration
@@ -154,7 +157,9 @@ The CLI should support configuration via:
 | `--dataset` | `GTL_DATASET` | `dataset` | BigQuery dataset name |
 | `--repo-id` | `GTL_REPO_ID` | `repo_id` | Repository identifier (auto-detected from git remote if not set) |
 | `--branch` | `GTL_BRANCH` | `branch` | Branch to sync (defaults to current branch) |
+| `--location` | `GTL_LOCATION` | `location` | BigQuery location, e.g. `EU` (default: location of an existing dataset, else `US`) |
 | `--max-file-size` | `GTL_MAX_FILE_SIZE` | `max_file_size` | Max file size in bytes (default: 102400) |
+| `--max-diff-size` | `GTL_MAX_DIFF_SIZE` | `max_diff_size` | Max size of a single diff in bytes (default: 1048576, 0 disables) |
 
 ## Core Functions
 
@@ -189,13 +194,31 @@ def get_current_files(max_size: int, branch: str | None = None) -> list[dict]:
 
 def is_binary(data: bytes) -> bool:
     """Check if content is binary (has null bytes)."""
+
+def run_git_bytes(*args: str) -> bytes | None:
+    """Run git and return raw stdout. File contents must not be stripped or
+    decoded as text -- stripping loses trailing newlines, and decoding raises
+    on binary files before is_binary can reject them."""
+
+def truncate_diff(diff: str, max_diff_size: int) -> str:
+    """Truncate an oversized diff on a byte boundary. 0 disables."""
 ```
 
 ### bigquery.py
 
 ```python
-def ensure_schema(client, dataset: str):
-    """Create tables if they don't exist."""
+def get_client(project: str, location: str | None = None):
+    """Create a BigQuery client bound to a location."""
+
+def load_rows(client, table_id: str, schema: list, rows: list[dict]):
+    """Append rows with a load job. Not the streaming API: streamed rows sit in
+    a buffer that UPDATE/MERGE cannot reach."""
+
+def ensure_dataset(client, dataset: str, location: str | None = None) -> str:
+    """Create the dataset if absent; return the location it lives in."""
+
+def ensure_schema(client, dataset: str, location: str | None = None) -> str:
+    """Create tables if they don't exist; return the dataset location."""
 
 def ensure_repo(client, dataset: str, repo_id: str, name: str, url: str):
     """Insert or update repository record."""
@@ -225,7 +248,10 @@ def upsert_current_files(client, dataset: str, repo_id: str, files: list[dict], 
 ### sync.py
 
 ```python
-def sync(project: str, dataset: str, repo_id: str, branch: str | None, all_branches: bool, max_file_size: int):
+def connect(project: str, dataset: str, location: str | None = None):
+    """Client + schema, with the client bound to the dataset's location."""
+
+def sync(project: str, dataset: str, location: str | None, repo_id: str, branch: str | None, all_branches: bool, max_file_size: int, max_diff_size: int):
     """Main sync orchestration:
     1. Determine which branches to sync
     2. For each branch, call sync_branch
@@ -287,7 +313,7 @@ jobs:
           python-version: '3.11'
 
       - run: |
-          pip install gtl
+          pip install git+https://github.com/veezoo-ai/gtl.git
           gtl sync --project=my-project --dataset=git_repo --branch=${{ github.ref_name }}
 ```
 
@@ -317,7 +343,7 @@ jobs:
           python-version: '3.11'
 
       - run: |
-          pip install gtl
+          pip install git+https://github.com/veezoo-ai/gtl.git
           gtl sync --project=my-project --dataset=git_repo --all-branches
 ```
 
@@ -328,6 +354,7 @@ Or with config file:
 ```yaml
 project: my-project
 dataset: git_repo
+location: EU
 branch: main
 max_file_size: 102400
 ```
@@ -335,7 +362,7 @@ max_file_size: 102400
 ```yaml
 # Simplified workflow
 - run: |
-    pip install gtl
+    pip install git+https://github.com/veezoo-ai/gtl.git
     gtl sync
 ```
 
@@ -367,7 +394,7 @@ gcloud iam service-accounts keys create key.json \
 ### 3. Initialize BigQuery Schema
 
 ```bash
-pip install gtl
+pip install git+https://github.com/veezoo-ai/gtl.git
 gtl init --project=my-project --dataset=git_repo
 ```
 
@@ -503,5 +530,10 @@ ORDER BY file_path;
 - Binary detection uses null-byte check in first 8KB
 - `current_files` is maintained per-branch (MERGE with delete for removed files)
 - Each branch's sync state is tracked independently via the `branches` table
-- Per-file diffs may be large; consider adding `--max-diff-size` option to truncate
+- Per-file diffs may be large; `--max-diff-size` truncates them (default 1MB)
+- Rows are written with load jobs, not the streaming API: streamed rows sit in a
+  buffer that `UPDATE`/`MERGE` cannot reach, which would break `update_branch_head`
+  and `upsert_current_files`
+- A BigQuery job must run in the dataset's location, and locations cannot be joined
+  across or changed later, so `--location` is set at `init` time
 - Renames are tracked with change_type "R" and old_path populated

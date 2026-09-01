@@ -4,9 +4,17 @@ import subprocess
 import re
 from pathlib import Path
 
+# Diffing the initial commit means diffing against the empty tree, which
+# `git diff` cannot do -- it would compare against the working tree instead.
+ROOT_DIFF = ["diff-tree", "--root", "--no-commit-id", "-M"]
+
 
 def run_git(*args: str, check: bool = True) -> str:
-    """Run a git command and return stdout."""
+    """Run a git command and return stripped stdout.
+
+    Suitable for metadata (SHAs, branch names, porcelain output). File contents
+    must use run_git_bytes instead, which neither strips nor decodes.
+    """
     result = subprocess.run(
         ["git", *args],
         capture_output=True,
@@ -14,6 +22,19 @@ def run_git(*args: str, check: bool = True) -> str:
         check=check,
     )
     return result.stdout.strip()
+
+
+def run_git_bytes(*args: str) -> bytes | None:
+    """Run a git command and return raw stdout, or None if it failed.
+
+    File contents go through here rather than run_git: stripping would drop
+    trailing newlines and leading whitespace, and decoding as text raises on
+    binary files before is_binary ever gets to reject them.
+    """
+    result = subprocess.run(["git", *args], capture_output=True)
+    if result.returncode != 0:
+        return None
+    return result.stdout
 
 
 def get_current_branch() -> str | None:
@@ -243,8 +264,17 @@ def get_new_commits(last_sha: str | None, branch: str | None = None) -> list[dic
     return commits
 
 
-def get_file_changes(sha: str, parent_sha: str | None) -> list[dict]:
+def get_file_changes(
+    sha: str,
+    parent_sha: str | None,
+    max_diff_size: int = 0,
+) -> list[dict]:
     """Get per-file diffs for a commit.
+
+    Args:
+        sha: Commit SHA.
+        parent_sha: Parent commit SHA, or None for the initial commit.
+        max_diff_size: Truncate each diff to this many bytes. 0 disables it.
 
     Returns list of dicts with:
     - file_path, change_type, old_path, diff, additions, deletions
@@ -255,8 +285,9 @@ def get_file_changes(sha: str, parent_sha: str | None) -> list[dict]:
     if parent_sha:
         diff_args = ["diff", "--numstat", "-M", parent_sha, sha]
     else:
-        # Initial commit: compare against empty tree
-        diff_args = ["diff", "--numstat", "-M", "--root", sha]
+        # Initial commit: compare against the empty tree. `git diff --root <sha>`
+        # would compare it against the working tree instead.
+        diff_args = ROOT_DIFF + ["--numstat", sha]
 
     numstat_output = run_git(*diff_args, check=False)
 
@@ -264,7 +295,7 @@ def get_file_changes(sha: str, parent_sha: str | None) -> list[dict]:
     if parent_sha:
         status_args = ["diff", "--name-status", "-M", parent_sha, sha]
     else:
-        status_args = ["diff", "--name-status", "-M", "--root", sha]
+        status_args = ROOT_DIFF + ["--name-status", sha]
 
     status_output = run_git(*status_args, check=False)
 
@@ -327,7 +358,9 @@ def get_file_changes(sha: str, parent_sha: str | None) -> list[dict]:
         info = file_info.get(path, {"change_type": "M", "old_path": None})
 
         # Get the actual diff for this file
-        diff = get_file_diff(sha, parent_sha, path, info.get("old_path"))
+        diff = get_file_diff(
+            sha, parent_sha, path, info.get("old_path"), max_diff_size
+        )
 
         changes.append({
             "file_path": path,
@@ -341,7 +374,33 @@ def get_file_changes(sha: str, parent_sha: str | None) -> list[dict]:
     return changes
 
 
-def get_file_diff(sha: str, parent_sha: str | None, file_path: str, old_path: str | None) -> str:
+def truncate_diff(diff: str, max_diff_size: int) -> str:
+    """Truncate a diff that exceeds max_diff_size bytes.
+
+    A value of 0 or less disables truncation. A single BigQuery row is capped
+    well below the size a wholesale file rewrite can produce, so an uncapped
+    diff can fail the whole load job. The marker keeps truncated rows obvious
+    in BigQuery rather than silently short.
+    """
+    if max_diff_size <= 0:
+        return diff
+
+    encoded = diff.encode("utf-8")
+    if len(encoded) <= max_diff_size:
+        return diff
+
+    # errors="ignore" drops a trailing partial multi-byte character
+    truncated = encoded[:max_diff_size].decode("utf-8", errors="ignore")
+    return f"{truncated}\n... [gtl: diff truncated at {max_diff_size} bytes]"
+
+
+def get_file_diff(
+    sha: str,
+    parent_sha: str | None,
+    file_path: str,
+    old_path: str | None,
+    max_diff_size: int = 0,
+) -> str:
     """Get the diff for a specific file in a commit."""
     if parent_sha:
         if old_path:
@@ -349,9 +408,9 @@ def get_file_diff(sha: str, parent_sha: str | None, file_path: str, old_path: st
         else:
             diff_args = ["diff", parent_sha, sha, "--", file_path]
     else:
-        diff_args = ["diff", "--root", sha, "--", file_path]
+        diff_args = ROOT_DIFF + ["-p", sha, "--", file_path]
 
-    return run_git(*diff_args, check=False)
+    return truncate_diff(run_git(*diff_args, check=False), max_diff_size)
 
 
 def get_current_files(max_size: int, branch: str | None = None) -> list[dict]:
@@ -442,17 +501,12 @@ def get_files_from_branch(max_size: int, branch: str) -> list[dict]:
         if not file_path:
             continue
 
-        # Get file content from the branch
-        try:
-            content = run_git("show", f"{branch}:{file_path}", check=False)
-        except subprocess.CalledProcessError:
-            continue
-
-        if not content:
+        # Get file content from the branch, as raw bytes
+        content_bytes = run_git_bytes("show", f"{branch}:{file_path}")
+        if content_bytes is None:
             continue
 
         # Get file size
-        content_bytes = content.encode("utf-8")
         size_bytes = len(content_bytes)
 
         if size_bytes > max_size:
@@ -460,6 +514,12 @@ def get_files_from_branch(max_size: int, branch: str) -> list[dict]:
 
         # Skip binary files
         if is_binary(content_bytes):
+            continue
+
+        # Decode content
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
             continue
 
         # Get last commit that touched this file on this branch
